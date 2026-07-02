@@ -1,0 +1,12 @@
+name: mail-digest-bot
+tariffId: "1"
+
+meta:
+  environment: python
+  toolchain:
+    name: pip
+    version: "3.12"
+
+run:
+  command: python3 -u mail_digest_bot.py
+  persistenceMount: /data
