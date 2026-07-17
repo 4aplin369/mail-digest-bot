@@ -11,11 +11,12 @@ import unicodedata
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from email.header import decode_header, make_header
 from email.message import Message
 from email.utils import parsedate_to_datetime
 from typing import Iterable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 DEFAULT_IMPORTANT_KEYWORDS = (
@@ -161,6 +162,7 @@ HELP_TEXT = """Я показываю входящие письма из Янде
 /status - показать текущие настройки
 /help - показать эту справку
 
+Ещё я автоматически присылаю дайджест каждый день по расписанию.
 В дайджесте у писем есть кнопки: пометить прочитанным и перенести в корзину."""
 
 
@@ -202,6 +204,11 @@ def env(name: str, default: str | None = None, required: bool = False) -> str:
     if required and not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value or ""
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    fallback = "true" if default else "false"
+    return env(name, fallback).lower() in {"1", "true", "yes", "on"}
 
 
 def split_keywords(value: str, fallback: Iterable[str]) -> tuple[str, ...]:
@@ -321,6 +328,10 @@ def imap_settings() -> tuple[str, int, str, str, str]:
     )
 
 
+def unread_only() -> bool:
+    return env_bool("UNREAD_ONLY", True)
+
+
 def metadata_value(metadata: bytes, name: str) -> str:
     match = re.search(rb"\b" + name.encode("ascii") + rb" ([^ )]+)", metadata)
     if not match:
@@ -336,6 +347,38 @@ def metadata_flags(metadata: bytes) -> set[str]:
         flag.decode("ascii", errors="replace").lower()
         for flag in match.group(1).split()
     }
+
+
+def parse_mailbox_list_item(item: bytes) -> tuple[set[str], str] | None:
+    match = re.match(rb"\((?P<flags>[^)]*)\)\s+\"[^\"]*\"\s+(?P<name>.+)$", item)
+    if not match:
+        return None
+    flags = {
+        flag.decode("ascii", errors="replace").lower()
+        for flag in match.group("flags").split()
+    }
+    raw_name = match.group("name").strip()
+    if raw_name.startswith(b'"') and raw_name.endswith(b'"'):
+        raw_name = raw_name[1:-1].replace(b'\\"', b'"').replace(b"\\\\", b"\\")
+    return flags, raw_name.decode("ascii", errors="replace")
+
+
+def quote_mailbox_name(mailbox_name: str) -> str:
+    escaped = mailbox_name.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def find_trash_mailbox(imap: imaplib.IMAP4_SSL) -> str:
+    status, folders = imap.list()
+    if status == "OK":
+        for item in folders or []:
+            parsed = parse_mailbox_list_item(item)
+            if not parsed:
+                continue
+            flags, mailbox_name = parsed
+            if "\\trash" in flags:
+                return mailbox_name
+    return env("YANDEX_TRASH_MAILBOX", "Trash")
 
 
 def classify(
@@ -394,7 +437,10 @@ def fetch_messages() -> list[DigestItem]:
     with imaplib.IMAP4_SSL(host, port, ssl_context=context) as imap:
         imap.login(username, password)
         imap.select(mailbox, readonly=True)
-        status, data = imap.search(None, "SINCE", since_query)
+        search_criteria = ["SINCE", since_query]
+        if unread_only():
+            search_criteria.append("UNSEEN")
+        status, data = imap.search(None, *search_criteria)
         if status != "OK":
             raise RuntimeError(f"IMAP search failed: {status}")
 
@@ -461,17 +507,17 @@ def mark_message_seen(uid: str, seen: bool = True) -> None:
 
 def move_message_to_trash(uid: str) -> None:
     host, port, username, password, mailbox = imap_settings()
-    trash_mailbox = env("YANDEX_TRASH_MAILBOX", "Trash")
     context = ssl.create_default_context()
     with imaplib.IMAP4_SSL(host, port, ssl_context=context) as imap:
         imap.login(username, password)
         imap.select(mailbox, readonly=False)
-        status, _ = imap.uid("MOVE", uid, trash_mailbox)
+        trash_mailbox = find_trash_mailbox(imap)
+        status, _ = imap.uid("MOVE", uid, quote_mailbox_name(trash_mailbox))
         imap.close()
     if status != "OK":
         raise RuntimeError(
             f"IMAP MOVE to {trash_mailbox!r} failed for UID {uid}: {status}. "
-            "Проверь YANDEX_TRASH_MAILBOX в .env."
+            "Проверь папку корзины в IMAP."
         )
 
 
@@ -491,7 +537,8 @@ def format_digest(items: list[DigestItem]) -> str:
 
 def empty_digest_text() -> str:
     now = datetime.now().strftime("%d.%m.%Y")
-    return f"Почтовый дайджест за {now}\n\nЗа выбранный период писем не найдено."
+    scope = "непрочитанных писем" if unread_only() else "писем"
+    return f"Почтовый дайджест за {now}\n\nЗа выбранный период {scope} не найдено."
 
 
 def digest_groups(items: list[DigestItem]) -> tuple[
@@ -524,6 +571,7 @@ def format_digest_summary(items: list[DigestItem]) -> str:
     lines = [
         f"Почтовый дайджест за {now}",
         f"Период: последние {env('LOOKBACK_HOURS', '30')} часов",
+        f"Режим: {'только непрочитанные' if unread_only() else 'все письма'}",
         f"Показано писем: {len(items)} из лимита {env('MAX_MESSAGES', '80')}",
         "",
         "Сводка:",
@@ -661,6 +709,63 @@ def send_digest_to_chat(chat_id: str | int) -> None:
         )
 
 
+def daily_digest_time() -> datetime_time | None:
+    value = env("DAILY_DIGEST_TIME", "09:00").strip()
+    if value.lower() in {"", "off", "false", "none", "disabled"}:
+        return None
+    try:
+        hour_text, minute_text = value.split(":", 1)
+        return datetime_time(hour=int(hour_text), minute=int(minute_text))
+    except ValueError as error:
+        raise RuntimeError("DAILY_DIGEST_TIME должен быть в формате HH:MM, например 09:00") from error
+
+
+def daily_digest_timezone():
+    timezone_name = env("DAILY_DIGEST_TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow"
+    try:
+        return ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        if timezone_name == "Europe/Moscow":
+            return timezone(timedelta(hours=3), name="Europe/Moscow")
+        raise RuntimeError(f"Неизвестный часовой пояс DAILY_DIGEST_TIMEZONE={timezone_name!r}")
+
+
+def initial_daily_digest_date() -> date | None:
+    scheduled_time = daily_digest_time()
+    if scheduled_time is None:
+        return None
+    now = datetime.now(daily_digest_timezone())
+    if now.time() >= scheduled_time:
+        return now.date()
+    return None
+
+
+def maybe_send_daily_digest(last_sent_date: date | None) -> date | None:
+    scheduled_time = daily_digest_time()
+    if scheduled_time is None:
+        return None
+
+    now = datetime.now(daily_digest_timezone())
+    if last_sent_date == now.date() or now.time() < scheduled_time:
+        return last_sent_date
+
+    chat_id = env("TELEGRAM_CHAT_ID", required=True)
+    send_telegram_message(
+        chat_id,
+        f"Доброе утро. Автоматический дайджест за {now.strftime('%d.%m.%Y')}.",
+    )
+    send_digest_to_chat(chat_id)
+    return now.date()
+
+
+def daily_digest_status() -> str:
+    scheduled_time = daily_digest_time()
+    if scheduled_time is None:
+        return "выключен"
+    timezone_name = env("DAILY_DIGEST_TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow"
+    return f"{scheduled_time.strftime('%H:%M')} {timezone_name}"
+
+
 def set_telegram_commands() -> None:
     commands = [
         {"command": "digest", "description": "Показать письма и сводку"},
@@ -687,8 +792,10 @@ def format_status() -> str:
             f"Папка: {env('YANDEX_MAILBOX', 'INBOX')}",
             f"IMAP: {env('YANDEX_IMAP_HOST', 'imap.yandex.ru')}:{env('YANDEX_IMAP_PORT', '993')}",
             f"Период поиска: последние {env('LOOKBACK_HOURS', '30')} часов",
+            f"Режим писем: {'только непрочитанные' if unread_only() else 'все письма'}",
             f"Лимит писем: {env('MAX_MESSAGES', '80')}",
             f"Корзина: {env('YANDEX_TRASH_MAILBOX', 'Trash')}",
+            f"Автодайджест: {daily_digest_status()}",
             f"Ключевые слова: {keyword_source}",
             f"DRY_RUN: {'да' if dry_run else 'нет'}",
         ]
@@ -710,6 +817,7 @@ def is_allowed_chat(chat_id: str | int) -> bool:
 
 
 def answer_callback_query(callback_query_id: str, text: str) -> None:
+    text = snippet(text, limit=180)
     telegram_request(
         "answerCallbackQuery",
         {
@@ -791,8 +899,9 @@ def handle_callback_query(callback_query: dict[str, object]) -> None:
         if callback_query_id:
             answer_callback_query(callback_query_id, "Не понимаю эту кнопку.")
     except Exception as error:
+        print(f"callback action failed: {error}", file=sys.stderr, flush=True)
         if callback_query_id:
-            answer_callback_query(callback_query_id, f"Не получилось: {error}")
+            answer_callback_query(callback_query_id, "Не получилось выполнить действие. Подробности в логе.")
 
 
 def handle_telegram_message(message: dict[str, object]) -> None:
@@ -831,7 +940,11 @@ def poll_telegram_updates() -> int:
     env("TELEGRAM_BOT_TOKEN", required=True)
     env("TELEGRAM_CHAT_ID", required=True)
     offset: int | None = None
-    print("Mail Digest Bot is running. Send /digest in Telegram.", flush=True)
+    last_daily_digest_date = initial_daily_digest_date()
+    print(
+        f"Mail Digest Bot is running. Send /digest in Telegram. Daily digest: {daily_digest_status()}.",
+        flush=True,
+    )
     try:
         set_telegram_commands()
     except Exception as error:
@@ -839,6 +952,7 @@ def poll_telegram_updates() -> int:
 
     while True:
         try:
+            last_daily_digest_date = maybe_send_daily_digest(last_daily_digest_date)
             params = {
                 "timeout": "30",
                 "allowed_updates": json.dumps(["message", "callback_query"]),
